@@ -194,6 +194,18 @@ select option { background:var(--card); }
 .toast { position:fixed; bottom:24px; right:24px; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 18px; font-size:14px; box-shadow:0 8px 24px rgba(0,0,0,.4); z-index:400; opacity:0; transform:translateY(8px); transition:all .25s; pointer-events:none; }
 .toast.show { opacity:1; transform:translateY(0); }
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+window.addEventListener('load', () => {
+  // Wait for GSI to load
+  const checkGSI = setInterval(() => {
+    if (window.google && window.google.accounts) {
+      clearInterval(checkGSI);
+      initGoogleApi();
+    }
+  }, 200);
+});
+</script>
 </head>
 <body>
 
@@ -201,10 +213,9 @@ select option { background:var(--card); }
   <div class="logo">나만의 <span>오답노트</span></div>
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
     <div class="count-badge" id="totalBadge">문제 <strong>0</strong>개</div>
-    <button class="hdr-btn" onclick="exportData()" title="데이터 백업">💾 내보내기</button>
-    <label class="hdr-btn" title="백업 파일 불러오기" style="cursor:pointer">
-      📂 불러오기<input type="file" accept=".json" onchange="importData(event)" style="display:none">
-    </label>
+    <button class="hdr-btn" id="gdriveBtn" onclick="gdriveSync()">☁️ 드라이브 연동</button>
+    <button class="hdr-btn" onclick="exportData()">💾 내보내기</button>
+    <label class="hdr-btn" style="cursor:pointer">📂 불러오기<input type="file" accept=".json" onchange="importData(event)" style="display:none"></label>
   </div>
 </header>
 
@@ -365,17 +376,172 @@ select option { background:var(--card); }
 <script>
 const KEY_Q = 'odap_pwa_q';
 const KEY_W = 'odap_pwa_w';
+const CLIENT_ID = '427985071771-6c40el5dm15iu5aot6ud34lhd703ireq.apps.googleusercontent.com';
+const SCOPES = 'https://www.googleapis.com/auth/drive.appdata';
+const DRIVE_FILE_NAME = 'odap_data.json';
 
 // ── STATE ──
 let questions = [], wrongNotes = [];
+let gdriveConnected = false;
+let driveFileId = null;
+let tokenClient = null;
+
+// Load from localStorage first (fast)
 try { questions  = JSON.parse(localStorage.getItem(KEY_Q) || '[]'); } catch(e){}
 try { wrongNotes = JSON.parse(localStorage.getItem(KEY_W) || '[]'); } catch(e){}
 
 function save() {
+  // Always save to localStorage
   try {
     localStorage.setItem(KEY_Q, JSON.stringify(questions));
     localStorage.setItem(KEY_W, JSON.stringify(wrongNotes));
-  } catch(e) { toast('⚠️ 저장 공간 부족 — 오래된 문제를 삭제해보세요'); }
+  } catch(e) {}
+  // If Drive connected, save to Drive too (debounced)
+  if (gdriveConnected) saveToDrive();
+}
+
+// ── GOOGLE DRIVE ──
+function initGoogleApi() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    callback: async (resp) => {
+      if (resp.error) { toast('⚠️ 구글 로그인 실패'); return; }
+      gdriveConnected = true;
+      localStorage.setItem('gdrive_token', resp.access_token);
+      updateDriveBtn();
+      toast('☁️ 구글 드라이브 연동됐어요! 데이터 불러오는 중...');
+      await loadFromDrive();
+    }
+  });
+
+  // Auto-reconnect if token saved
+  const saved = localStorage.getItem('gdrive_token');
+  if (saved) {
+    gdriveConnected = true;
+    updateDriveBtn();
+    loadFromDrive();
+  }
+}
+
+function updateDriveBtn() {
+  const btn = document.getElementById('gdriveBtn');
+  if (!btn) return;
+  if (gdriveConnected) {
+    btn.textContent = '☁️ 드라이브 연결됨';
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
+  } else {
+    btn.textContent = '☁️ 드라이브 연동';
+    btn.style.color = '';
+    btn.style.borderColor = '';
+  }
+}
+
+function gdriveSync() {
+  if (gdriveConnected) {
+    if (confirm('구글 드라이브 연동을 해제할까요?')) {
+      gdriveConnected = false;
+      driveFileId = null;
+      localStorage.removeItem('gdrive_token');
+      updateDriveBtn();
+      toast('드라이브 연동이 해제됐어요.');
+    }
+    return;
+  }
+  if (!tokenClient) { toast('⚠️ 구글 API 로딩 중이에요. 잠시 후 다시 시도해주세요.'); return; }
+  tokenClient.requestAccessToken();
+}
+
+async function driveRequest(method, path, body, token) {
+  const t = token || localStorage.getItem('gdrive_token');
+  const res = await fetch('https://www.googleapis.com' + path, {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + t,
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
+    ...(body ? { body: JSON.stringify(body) } : {})
+  });
+  if (res.status === 401) {
+    // Token expired
+    gdriveConnected = false;
+    localStorage.removeItem('gdrive_token');
+    updateDriveBtn();
+    toast('⚠️ 드라이브 연결이 만료됐어요. 다시 연동해주세요.');
+    return null;
+  }
+  return res.ok ? res : null;
+}
+
+async function findDriveFile() {
+  const res = await driveRequest('GET', `/drive/v3/files?spaces=appDataFolder&q=name='${DRIVE_FILE_NAME}'&fields=files(id,name)`);
+  if (!res) return null;
+  const data = await res.json();
+  return data.files && data.files.length > 0 ? data.files[0].id : null;
+}
+
+async function loadFromDrive() {
+  try {
+    driveFileId = await findDriveFile();
+    if (!driveFileId) {
+      toast('☁️ 드라이브에 저장된 데이터가 없어요. 새로 시작할게요!');
+      return;
+    }
+    const res = await driveRequest('GET', `/drive/v3/files/${driveFileId}?alt=media`);
+    if (!res) return;
+    const data = await res.json();
+    if (data.questions) {
+      // Merge with local
+      const existQIds = new Set(questions.map(q=>q.id));
+      const existWIds = new Set(wrongNotes.map(w=>w.id));
+      const addedQ = data.questions.filter(q=>!existQIds.has(q.id));
+      const addedW = (data.wrongNotes||[]).filter(w=>!existWIds.has(w.id));
+      questions  = [...questions,  ...addedQ];
+      wrongNotes = [...wrongNotes, ...addedW];
+      try {
+        localStorage.setItem(KEY_Q, JSON.stringify(questions));
+        localStorage.setItem(KEY_W, JSON.stringify(wrongNotes));
+      } catch(e) {}
+      renderQList(); updateWrongDot(); updateTagSuggestions();
+      toast(`☁️ 드라이브에서 불러왔어요! (문제 ${questions.length}개)`);
+    }
+  } catch(e) { toast('⚠️ 드라이브 불러오기 실패: ' + e.message); }
+}
+
+let saveDriveTimer = null;
+function saveToDrive() {
+  clearTimeout(saveDriveTimer);
+  saveDriveTimer = setTimeout(async () => {
+    try {
+      const payload = JSON.stringify({ version:1, questions, wrongNotes });
+      const token = localStorage.getItem('gdrive_token');
+      if (!driveFileId) driveFileId = await findDriveFile();
+
+      if (driveFileId) {
+        // Update existing file
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
+          method: 'PATCH',
+          headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: payload
+        });
+      } else {
+        // Create new file in appDataFolder
+        const meta = await fetch('https://www.googleapis.com/drive/v3/files?fields=id', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: DRIVE_FILE_NAME, parents: ['appDataFolder'] })
+        });
+        const metaData = await meta.json();
+        driveFileId = metaData.id;
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
+          method: 'PATCH',
+          headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: payload
+        });
+      }
+    } catch(e) { console.error('Drive save error:', e); }
+  }, 1500); // debounce 1.5초
 }
 
 // ── TAGS / UNITS ──

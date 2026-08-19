@@ -1,4 +1,4 @@
-const CACHE = 'odap-v1';
+const CACHE = 'odap-v2';
 const FILES = ['./'];
 
 self.addEventListener('install', e => {
